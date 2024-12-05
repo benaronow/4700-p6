@@ -23,17 +23,12 @@ class Server:
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
         
-    def getResponse(self, request):
+    def get_local_res(self, response):
         zoneStr = open('configs/example.com.zone', 'r').read()
         
-        question = request.get_q()
+        question = response.get_q()
         qname = question.qname
         qtype = question.qtype
-        
-        response = request.reply()
-        
-        # set authoritative bit
-        response.header.set_aa(1)
         
         # handles NS question type
         if qtype == 2:
@@ -46,6 +41,9 @@ class Server:
                     for rr2 in RR.fromZone(zoneStr):
                         if rr2.rname == qname2:
                             response.add_ar(rr2)
+             
+            # sets status to NXDOMAIN if no auth
+            if response.header.a == 0: response.header.set_rcode(3)
             return response
         
         # handles other question types
@@ -64,10 +62,22 @@ class Server:
             # adds authority section, should probably un-hard-code
             if (rr.rname == 'example.com') & (rr.rtype == 2): response.add_auth(rr)
                             
-        # sets status to NXDOMAIN if no answers?
+        # sets status to NXDOMAIN if no answers
         if response.header.a == 0: response.header.set_rcode(3)
-        
         return response
+    
+    # Sending a query to a DNS server and receiving a response.
+    def get_ext_res(self, message):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("0.0.0.0", 60053))
+            sock.settimeout(1000)
+            sock.sendto(message, (self.root_ip, 60053))
+            data, _ = sock.recvfrom(65535)
+            request = DNSRecord.parse(data)
+            return request
+        except (socket.timeout, socket.error):
+            return None
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -76,9 +86,23 @@ class Server:
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
 
-        response = self.getResponse(request.reply())
-        
-        self.send(addr, response)
+        response = request.reply()
+        local_res = self.get_local_res(response)
+        print(local_res.header.rcode)
+        if local_res.header.rcode != 3:
+            # set authoritative bit
+            local_res.header.set_aa(1)
+            self.send(addr, local_res)
+        else:
+            ext_res = self.get_ext_res(data)
+            if ext_res.header.rcode != 3:
+                # unset authoritative bit
+                ext_res.header.set_aa(0)
+                # set recursion available bit
+                ext_res.header.set_ra(1)
+                self.send(addr, ext_res)
+            else:
+                self.send(addr, local_res)
 
     def run(self):
         seq = 0
