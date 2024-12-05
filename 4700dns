@@ -107,6 +107,8 @@ class Server:
                 ext_res.header.set_aa(0)
                 # set recursion available bit
                 ext_res.header.set_ra(1)
+                # unset truncation bit
+                ext_res.header.set_tc(0)
                 self.send(addr, ext_res)
             else:
                 self.send(addr, local_res)
