@@ -23,6 +23,7 @@ class Server:
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
         
+    # Gets a response from the local authoritative zone
     def get_local_res(self, response):
         zoneStr = open('configs/example.com.zone', 'r').read()
         
@@ -66,18 +67,26 @@ class Server:
         if response.header.a == 0: response.header.set_rcode(3)
         return response
     
-    # Sending a query to a DNS server and receiving a response.
-    def get_ext_res(self, message):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind(("0.0.0.0", 60053))
-            sock.settimeout(1000)
-            sock.sendto(message, (self.root_ip, 60053))
-            data, _ = sock.recvfrom(65535)
-            request = DNSRecord.parse(data)
+    # Queries other DNS servers to get response
+    def get_ext_res(self, data, qtype):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # right ip and port???
+        sock.bind(("0.0.0.0", 60053))
+        print(self.root_ip)
+        sock.sendto(data, (self.root_ip, 60053))
+        ext_data, _ = sock.recvfrom(65535)
+        request = DNSRecord.parse(ext_data)
+        
+        if qtype == 2:
             return request
-        except (socket.timeout, socket.error):
-            return None
+        
+        while True:
+            new_ip = str(request.ar[0].rdata)
+            sock.sendto(data, (new_ip, 60053))
+            ext_data, _ = sock.recvfrom(65535)
+            request = DNSRecord.parse(ext_data)
+            
+            if request.header.a == 1: return request         
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -94,7 +103,7 @@ class Server:
             local_res.header.set_aa(1)
             self.send(addr, local_res)
         else:
-            ext_res = self.get_ext_res(data)
+            ext_res = self.get_ext_res(data, response.get_q().qtype)
             if ext_res.header.rcode != 3:
                 # unset authoritative bit
                 ext_res.header.set_aa(0)
