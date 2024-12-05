@@ -72,21 +72,20 @@ class Server:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # right ip and port???
         sock.bind(("0.0.0.0", 60053))
-        print(self.root_ip)
         sock.sendto(data, (self.root_ip, 60053))
         ext_data, _ = sock.recvfrom(65535)
-        request = DNSRecord.parse(ext_data)
+        response = DNSRecord.parse(ext_data)
         
-        if qtype == 2:
-            return request
+        if (qtype == 2) | (response.header.rcode == 3):
+            return response
         
         while True:
-            new_ip = str(request.ar[0].rdata)
+            new_ip = str(response.ar[0].rdata)
             sock.sendto(data, (new_ip, 60053))
             ext_data, _ = sock.recvfrom(65535)
-            request = DNSRecord.parse(ext_data)
+            response = DNSRecord.parse(ext_data)
             
-            if request.header.a == 1: return request         
+            if response.header.a == 1: return response         
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -97,7 +96,6 @@ class Server:
 
         response = request.reply()
         local_res = self.get_local_res(response)
-        print(local_res.header.rcode)
         if local_res.header.rcode != 3:
             # set authoritative bit
             local_res.header.set_aa(1)
