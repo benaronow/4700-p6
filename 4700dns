@@ -3,9 +3,6 @@
 import argparse, socket, time, json, select, struct, sys, math
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
 
-zone = open('configs/example.com.zone', 'r')
-zoneStr = zone.read()
-
 class Server:
     def __init__(self, root_ip, domain, port):
         self.root_ip = root_ip
@@ -27,19 +24,45 @@ class Server:
         self.socket.sendto(message.pack(), addr)
         
     def getResponse(self, request):
+        zoneStr = open('configs/example.com.zone', 'r').read()
+        
         question = request.get_q()
         qname = question.qname
+        qtype = question.qtype
+        
         response = request.reply()
         
+        # handles NS question type
+        if qtype == 2:
+            for rr in RR.fromZone(zoneStr):
+                # adds matching answer if NS
+                if (rr.rname == qname) & (rr.rtype == 2):
+                    response.add_answer(rr)
+                    
+                    qname2 = rr.rdata.toZone()
+                    for rr2 in RR.fromZone(zoneStr):
+                        if rr2.rname == qname2:
+                            response.add_ar(rr2)
+            return response
+        
+        # handles other question types
         for rr in RR.fromZone(zoneStr):
+            # adds matching answer if not SOA or NS
             if (rr.rname == qname) & (rr.rtype != 6) & (rr.rtype != 2):
                 response.add_answer(rr)
+                
+                # adds additional answers if rr is CNAME
                 if (rr.rtype == 5):
                     qname2 = rr.rdata.toZone()
                     for rr2 in RR.fromZone(zoneStr):
                         if rr2.rname == qname2:
                             response.add_answer(rr2)
+            
+            # adds authority section, should probably un-hard-code
             if (rr.rname == 'example.com') & (rr.rtype == 2): response.add_auth(rr)
+                            
+        # sets status to NXDOMAIN if no answers?
+        if response.header.a == 0: response.header.set_rcode(3)
         
         return response
 
@@ -50,7 +73,7 @@ class Server:
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
 
-        response = self.getResponse(request)
+        response = self.getResponse(request.reply())
         
         self.send(addr, response)
 
