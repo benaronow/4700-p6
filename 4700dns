@@ -62,7 +62,9 @@ class Server:
             
             # adds authority section, should probably un-hard-code
             if (rr.rname == 'example.com') & (rr.rtype == 2): response.add_auth(rr)
-                            
+            
+        #TODO: Search cached responses before marking NXDOMAIN
+        
         # sets status to NXDOMAIN if no answers
         if response.header.a == 0: response.header.set_rcode(3)
         return response
@@ -87,7 +89,9 @@ class Server:
             ext_data, _ = sock.recvfrom(65535)
             response = DNSRecord.parse(ext_data)
             
-            if response.header.a > 0: return response         
+            if response.header.a > 0: return response
+            
+        #TODO: Cache responses, clear after TTL (time to live)
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -95,14 +99,18 @@ class Server:
         # Unpack the DNS request
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
+        
+        #TODO: Run multiple of these in parallel, figure out what bailiwick is
 
         response = request.reply()
         local_res = self.get_local_res(response)
+        # If answer found locally, send response
         if local_res.header.rcode != 3:
             # set authoritative bit
             local_res.header.set_aa(1)
             self.send(addr, local_res)
         else:
+            # If answer found externally, send response
             ext_res = self.get_ext_res(data, response.get_q().qtype)
             if ext_res.header.rcode != 3:
                 # unset authoritative bit
@@ -113,12 +121,16 @@ class Server:
                 ext_res.header.set_tc(0)
                 self.send(addr, ext_res)
             else:
+                # If no answer found, send NXDOMAIN response
                 self.send(addr, local_res)
 
     def run(self):
         seq = 0
         while True:
             socks = select.select([self.socket], [], [], 0.1)[0]
+            
+            #TODO: Figure out how to run in parallel from here?
+            
             for conn in socks:
                 self.recv(conn)
 
