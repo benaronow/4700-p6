@@ -3,10 +3,14 @@
 import argparse, socket, time, json, select, struct, sys, math
 from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
 
+zone = open('configs/example.com.zone', 'r')
+zoneStr = zone.read()
+
 class Server:
     def __init__(self, root_ip, domain, port):
         self.root_ip = root_ip
         self.domain = domain
+        self.log(domain)
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("0.0.0.0", port))
@@ -21,6 +25,23 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
+        
+    def getResponse(self, request):
+        question = request.get_q()
+        qname = question.qname
+        response = request.reply()
+        
+        for rr in RR.fromZone(zoneStr):
+            if (rr.rname == qname) & (rr.rtype != 6) & (rr.rtype != 2):
+                response.add_answer(rr)
+                if (rr.rtype == 5):
+                    qname2 = rr.rdata.toZone()
+                    for rr2 in RR.fromZone(zoneStr):
+                        if rr2.rname == qname2:
+                            response.add_answer(rr2)
+            if (rr.rname == 'example.com') & (rr.rtype == 2): response.add_auth(rr)
+        
+        return response
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -29,10 +50,7 @@ class Server:
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
 
-        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
-        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
-        response = request.reply()
-        response.add_answer(RR("abc.com", QTYPE.A, rdata=A("1.2.3.4"), ttl=60))       
+        response = self.getResponse(request)
         
         self.send(addr, response)
 
