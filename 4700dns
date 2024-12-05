@@ -32,6 +32,9 @@ class Server:
         
         response = request.reply()
         
+        # set authoritative bit
+        response.header.set_aa(1)
+        
         # handles NS question type
         if qtype == 2:
             for rr in RR.fromZone(zoneStr):
