@@ -29,16 +29,6 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
-
-    # Gets a cached response if it exists
-    def get_cached_response(self, ip, request):
-        if (ip, request.q.qname.idna(), request.q.qtype) in self.cache:
-            response, expiration, = self.cache[(ip, request.q.qname.idna(), request.q.qtype)]
-            # Return if cache entry has not expired
-            if time.time() < expiration: return response
-            # Delete entry if it has expired
-            else: del self.cache[(ip, request.q.qname.idna(), request.q.qtype)]
-        return None
         
     def is_within_bailiwick(self, record_name, authoritative_domain):
         """Check if the record's name is within the bailiwick of the authoritative domain."""
@@ -86,32 +76,69 @@ class Server:
             
             # adds authority section, should probably un-hard-code
             if rr.rname == 'example.com' and rr.rtype == 2: response.add_auth(rr)
-            
-        #TODO: Search cached responses before marking NXDOMAIN
         
         # sets status to NXDOMAIN if no answers
         if response.header.a == 0: response.header.set_rcode(3)
         return response
 
-    # Cache a response
-    def cache_response(self, ip, request, response, return_override = False):
-        # Calculate ttl by finding minimum
+    # Caches a response
+    def cache_response(self, request, response, ip):
+        # Calculate overall ttl by finding minimum
         min_ttl = float('inf')
         for rr in response.rr + response.auth + response.ar:
             if rr.ttl == 0: return
             if rr.ttl < min_ttl: min_ttl = rr.ttl 
         expiration = time.time() + min_ttl
         
-        self.cache[(ip, request.q.qname.idna(), request.q.qtype)] = (response, expiration)
+        self.cache[(request.get_q().qname, request.get_q().qtype, ip)] = (response, expiration)
+        
+    # Gets a cached response if it exists
+    def get_cached_response(self, request, ip):
+        qname = request.get_q().qname
+        qtype = request.get_q().qtype
+        if (qname, qtype, ip) in self.cache:
+            response, expiration = self.cache[(qname, qtype, ip)]
+            # Return if cache entry has not expired
+            if time.time() < expiration: return response
+            # Delete entry if it has expired
+            else: del self.cache[(qname, qtype, ip)]
+        return None
+    
+    # Ensure nothing outside the server's bailiwick is included in a response
+    def bw_check(self, request, response):
+        server = request.get_q().qname.idna().split(".")[-2] + "."
+        a_removed = False
+
+        # Return immediately if server is the root server
+        if server == ".": return (response, False)
+       
+        # Remove records from response outside of bailiwick
+        for rr in response.rr:
+            if not rr.rname.matchSuffix(server):
+                response.rr.remove(rr)
+                a_removed= True
+        # Remove authority records outside of bailiwick
+        for rr in response.auth:
+            if not rr.rname.matchSuffix(server):
+                response.auth.remove(rr)
+                a_removed = True
+        # Remove additional records outside of bailiwick
+        for rr in response.ar:
+            if not rr.rname.matchSuffix(server):
+                response.ar.remove(rr)
+                a_removed = True
+
+        # If all answers were removed, set flag
+        all_removed = response.header.a == 0 and a_removed
+        
+        return (response, all_removed)
 
     # Queries other DNS servers to get response
     def get_ext_res(self, data, qtype):
         # Immediately attempt to get a response from the cache
         request = DNSRecord.parse(data)
-        cached_response = self.get_cached_response(self.root_ip, request)
-        if cached_response:
-            self.log('@@@@@@@@@ RETURNING CACHED RESPONSE 1')
-            return cached_response
+        cached_response = self.get_cached_response(request, self.root_ip)
+        if cached_response: return cached_response
         
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(data, (self.root_ip, 60053))
@@ -128,14 +155,17 @@ class Server:
             new_ip = str(response.ar[0].rdata)
             
             # Attempt to get a response from the cache with the new address
-            cached_response = self.get_cached_response(new_ip, request)
+            cached_response = self.get_cached_response(request, new_ip)
             if cached_response: return cached_response
                 
             sock.sendto(data, (new_ip, 60053))
             ext_data, _ = sock.recvfrom(65535)
             response = DNSRecord.parse(ext_data)
+            
+            # Remove anything outside of the server's bailiwck
+            response, a_removed = self.bw_check(request, response)
 
-            if response.header.a > 0:
+            if response.header.a > 0 or a_removed:
                 for rr in response.rr:
                     if rr.rtype == QTYPE.CNAME:
                         # Resolve the CNAME record by recursively calling this function
@@ -150,7 +180,7 @@ class Server:
                                 response.add_answer(rr2)
                         break
                     
-                self.cache_response(new_ip, request, response)
+                self.cache_response(request, response, new_ip)
                 return response
         
         return response
