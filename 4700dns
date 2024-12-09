@@ -13,6 +13,8 @@ class Server:
         self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
 
+        self.cache = {}  # Cache for DNS responses
+
         self.log("Bound to port %d" % self.port)
 
     def log(self, message):
@@ -22,7 +24,39 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
+
+    def cache_response(self, query, response):
+        """Cache DNS responses that are within the bailiwick."""
+        for rr in response.rr + response.auth + response.ar:
+            if self.is_within_bailiwick(rr.rname, self.domain): # ???
+                expiration_time = time.time() + ttl
+                cache_key = (str(rr.rname), rr.rtype)
+                self.cache[cache_key] = (rr, expiration_time)
+                self.log(f"Cached {cache_key} with TTL {ttl}s")
+            else:
+                self.log(f"Record {rr.rname} rejected for caching (outside bailiwick)")
+
+
+    def get_cached_record(self, name, rtype):
+        """Retrieve a cached record if valid."""
+        cache_key = (str(name), rtype)
+        if cache_key in self.cache:
+            rr, expiration_time = self.cache[cache_key]
+            if time.time() < expiration_time:
+                self.log(f"Cache hit for {cache_key}")
+                return rr
+            else:
+                self.log(f"Cache expired for {cache_key}")
+                del self.cache[cache_key]
+        self.log(f"Cache miss for {cache_key}")
+        return None
         
+    def is_within_bailiwick(self, record_name, authoritative_domain):
+        """Check if the record's name is within the bailiwick of the authoritative domain."""
+        record_name_str = str(record_name).lower().rstrip('.')
+        authoritative_domain_str = str(authoritative_domain).lower().rstrip('.')
+        return record_name_str.endswith(f".{authoritative_domain_str}") or record_name_str == authoritative_domain_str
+
     # Gets a response from the local authoritative zone
     def get_local_res(self, response):
         zoneStr = open('configs/example.com.zone', 'r').read()
@@ -31,52 +65,71 @@ class Server:
         qname = question.qname
         qtype = question.qtype
         
+        # Check cache before handling locally
+        cached_record = self.get_cached_record(qname, qtype)
+        if cached_record:
+            response.add_answer(cached_record)
+            return response
+
+        authoritative_domain = self.domain  # Set to the domain you are authoritative for
+
         # handles NS question type
         if qtype == 2:
             for rr in RR.fromZone(zoneStr):
                 # adds matching answer if NS
                 if (rr.rname == qname) & (rr.rtype == 2):
                     response.add_answer(rr)
-                    
                     qname2 = rr.rdata.toZone()
                     for rr2 in RR.fromZone(zoneStr):
                         if rr2.rname == qname2:
                             response.add_ar(rr2)
              
             # sets status to NXDOMAIN if no auth
-            if response.header.a == 0: response.header.set_rcode(3)
+            if response.header.a == 0:
+                response.header.set_rcode(3)
+
             return response
         
         # handles other question types
         for rr in RR.fromZone(zoneStr):
             # adds matching answer if not SOA or NS
-            if (rr.rname == qname) & (rr.rtype != 6) & (rr.rtype != 2):
-                response.add_answer(rr)
-                
-                # adds additional answers if rr is CNAME
-                if (rr.rtype == 5):
-                    qname2 = rr.rdata.toZone()
-                    for rr2 in RR.fromZone(zoneStr):
-                        if rr2.rname == qname2:
-                            response.add_answer(rr2)
+            if rr.rname == qname and rr.rtype != 6 and rr.rtype != 2:
+                if self.is_within_bailiwick(rr.rname, authoritative_domain): # ???
+                    response.add_answer(rr)
+                    
+                    # adds additional answers if rr is CNAME
+                    if rr.rtype == 5:
+                        qname2 = rr.rdata.toZone()
+                        for rr2 in RR.fromZone(zoneStr):
+                            if rr2.rname == qname2:
+                                response.add_answer(rr2)
             
             # adds authority section, should probably un-hard-code
-            if (rr.rname == 'example.com') & (rr.rtype == 2): response.add_auth(rr)
+            if rr.rname == 'example.com' and rr.rtype == 2: response.add_auth(rr)
             
         #TODO: Search cached responses before marking NXDOMAIN
         
         # sets status to NXDOMAIN if no answers
         if response.header.a == 0: response.header.set_rcode(3)
         return response
-    
+
+
     # Queries other DNS servers to get response
     def get_ext_res(self, data, qtype):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # right ip and port???
         sock.bind(("0.0.0.0", 60053))
+
+        cached_response = self.get_cached_record(self.root_ip, qtype)
+        if cached_response:
+            return cached_response
+
         sock.sendto(data, (self.root_ip, 60053))
         ext_data, _ = sock.recvfrom(65535)
         response = DNSRecord.parse(ext_data)
+
+        # Cache the response
+        self.cache_response(DNSRecord.parse(ext_data).get_q(), response)
         
         # Returns immediately if type is NS or status is NXDOMAIN
         if (qtype == 2) | (response.header.rcode == 3):
@@ -84,15 +137,20 @@ class Server:
         
         # Recursively searches for answer
         while True:
+            if not response.ar:  # No additional records to process
+                 break
             new_ip = str(response.ar[0].rdata)
             sock.sendto(data, (new_ip, 60053))
             ext_data, _ = sock.recvfrom(65535)
             response = DNSRecord.parse(ext_data)
-            
-            if response.header.a > 0: return response
+
+            if response.header.a > 0:
+                self.cache_response(DNSRecord.parse(data).get_q(), response)
+                return response
+        return response
             
         #TODO: Cache responses, clear after TTL (time to live)
-
+        
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
 
@@ -125,7 +183,6 @@ class Server:
                 self.send(addr, local_res)
 
     def run(self):
-        seq = 0
         while True:
             socks = select.select([self.socket], [], [], 0.1)[0]
             
