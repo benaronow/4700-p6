@@ -1,7 +1,8 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+import argparse, socket, time, json, select, struct, sys, math, os
+from concurrent.futures import ThreadPoolExecutor
+from dnslib import DNSRecord, DNSQuestion, DNSHeader, RR, QTYPE, A
 
 class Server:
     def __init__(self, root_ip, domain, port):
@@ -12,8 +13,12 @@ class Server:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
+        
+        # Exucutor to get a response asynchronously
+        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() * 4)
 
-        self.cache = {}  # Cache for DNS responses
+        # Cache for DNS responses
+        self.cache = {}
 
         self.log("Bound to port %d" % self.port)
 
@@ -25,30 +30,14 @@ class Server:
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
 
-    def cache_response(self, query, response):
-        """Cache DNS responses that are within the bailiwick."""
-        for rr in response.rr + response.auth + response.ar:
-            if self.is_within_bailiwick(rr.rname, self.domain): # ???
-                expiration_time = time.time() + ttl
-                cache_key = (str(rr.rname), rr.rtype)
-                self.cache[cache_key] = (rr, expiration_time)
-                self.log(f"Cached {cache_key} with TTL {ttl}s")
-            else:
-                self.log(f"Record {rr.rname} rejected for caching (outside bailiwick)")
-
-
-    def get_cached_record(self, name, rtype):
-        """Retrieve a cached record if valid."""
-        cache_key = (str(name), rtype)
-        if cache_key in self.cache:
-            rr, expiration_time = self.cache[cache_key]
-            if time.time() < expiration_time:
-                self.log(f"Cache hit for {cache_key}")
-                return rr
-            else:
-                self.log(f"Cache expired for {cache_key}")
-                del self.cache[cache_key]
-        self.log(f"Cache miss for {cache_key}")
+    # Gets a cached response if it exists
+    def get_cached_response(self, ip, request):
+        if (ip, request.q.qname.idna(), request.q.qtype) in self.cache:
+            response, expiration, = self.cache[(ip, request.q.qname.idna(), request.q.qtype)]
+            # Return if cache entry has not expired
+            if time.time() < expiration: return response
+            # Delete entry if it has expired
+            else: del self.cache[(ip, request.q.qname.idna(), request.q.qtype)]
         return None
         
     def is_within_bailiwick(self, record_name, authoritative_domain):
@@ -64,14 +53,6 @@ class Server:
         question = response.get_q()
         qname = question.qname
         qtype = question.qtype
-        
-        # Check cache before handling locally
-        cached_record = self.get_cached_record(qname, qtype)
-        if cached_record:
-            response.add_answer(cached_record)
-            return response
-
-        authoritative_domain = self.domain  # Set to the domain you are authoritative for
 
         # handles NS question type
         if qtype == 2:
@@ -94,15 +75,14 @@ class Server:
         for rr in RR.fromZone(zoneStr):
             # adds matching answer if not SOA or NS
             if rr.rname == qname and rr.rtype != 6 and rr.rtype != 2:
-                if self.is_within_bailiwick(rr.rname, authoritative_domain): # ???
-                    response.add_answer(rr)
+                response.add_answer(rr)
                     
-                    # adds additional answers if rr is CNAME
-                    if rr.rtype == 5:
-                        qname2 = rr.rdata.toZone()
-                        for rr2 in RR.fromZone(zoneStr):
-                            if rr2.rname == qname2:
-                                response.add_answer(rr2)
+                # adds additional answers if rr is CNAME
+                if rr.rtype == 5:
+                    qname2 = rr.rdata.toZone()
+                    for rr2 in RR.fromZone(zoneStr):
+                        if rr2.rname == qname2:
+                            response.add_answer(rr2)
             
             # adds authority section, should probably un-hard-code
             if rr.rname == 'example.com' and rr.rtype == 2: response.add_auth(rr)
@@ -113,43 +93,67 @@ class Server:
         if response.header.a == 0: response.header.set_rcode(3)
         return response
 
+    # Cache a response
+    def cache_response(self, ip, request, response, return_override = False):
+        # Calculate ttl by finding minimum
+        min_ttl = float('inf')
+        for rr in response.rr + response.auth + response.ar:
+            if rr.ttl == 0: return
+            if rr.ttl < min_ttl: min_ttl = rr.ttl 
+        expiration = time.time() + min_ttl
+        
+        self.cache[(ip, request.q.qname.idna(), request.q.qtype)] = (response, expiration)
 
     # Queries other DNS servers to get response
     def get_ext_res(self, data, qtype):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # right ip and port???
-        sock.bind(("0.0.0.0", 60053))
-
-        cached_response = self.get_cached_record(self.root_ip, qtype)
+        # Immediately attempt to get a response from the cache
+        request = DNSRecord.parse(data)
+        cached_response = self.get_cached_response(self.root_ip, request)
         if cached_response:
+            self.log('@@@@@@@@@ RETURNING CACHED RESPONSE 1')
             return cached_response
-
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(data, (self.root_ip, 60053))
         ext_data, _ = sock.recvfrom(65535)
         response = DNSRecord.parse(ext_data)
-
-        # Cache the response
-        self.cache_response(DNSRecord.parse(ext_data).get_q(), response)
         
         # Returns immediately if type is NS or status is NXDOMAIN
-        if (qtype == 2) | (response.header.rcode == 3):
-            return response
+        if (qtype == 2) | (response.header.rcode == 3): return response
         
         # Recursively searches for answer
         while True:
-            if not response.ar:  # No additional records to process
-                 break
+            # Stop if no additional records to process
+            if not response.ar: break
             new_ip = str(response.ar[0].rdata)
+            
+            # Attempt to get a response from the cache with the new address
+            cached_response = self.get_cached_response(new_ip, request)
+            if cached_response: return cached_response
+                
             sock.sendto(data, (new_ip, 60053))
             ext_data, _ = sock.recvfrom(65535)
             response = DNSRecord.parse(ext_data)
 
             if response.header.a > 0:
-                self.cache_response(DNSRecord.parse(data).get_q(), response)
+                for rr in response.rr:
+                    if rr.rtype == QTYPE.CNAME:
+                        # Resolve the CNAME record by recursively calling this function
+                        cname_request = DNSRecord()
+                        cname_request.add_question(DNSQuestion(str(rr.rdata.label), QTYPE.A))
+                        cname_response = self.get_ext_res(cname_request.pack(), cname_request.get_q().qtype)
+                        
+                    # Finally add the A record to the response
+                        for rr2 in cname_response.rr:
+                            # This duplicates records in the response but if it ain't broke...
+                            if rr2.rtype == QTYPE.A or rr2.rtype == QTYPE.CNAME:
+                                response.add_answer(rr2)
+                        break
+                    
+                self.cache_response(new_ip, request, response)
                 return response
+        
         return response
-            
-        #TODO: Cache responses, clear after TTL (time to live)
         
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -158,8 +162,6 @@ class Server:
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
         
-        #TODO: Run multiple of these in parallel, figure out what bailiwick is
-
         response = request.reply()
         local_res = self.get_local_res(response)
         # If answer found locally, send response
@@ -177,6 +179,9 @@ class Server:
                 ext_res.header.set_ra(1)
                 # unset truncation bit
                 ext_res.header.set_tc(0)
+                # Set ID to match the request
+                if request.header.id:
+                    ext_res.header.id = request.header.id
                 self.send(addr, ext_res)
             else:
                 # If no answer found, send NXDOMAIN response
@@ -189,7 +194,7 @@ class Server:
             #TODO: Figure out how to run in parallel from here?
             
             for conn in socks:
-                self.recv(conn)
+                self.executor.submit(self.recv, conn)
 
         return
 
