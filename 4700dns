@@ -174,9 +174,8 @@ class Server:
                         # Recursively get the answers
                         c_response = self.get_ext_res(c_request.pack(), c_request.get_q().qtype)
                         
-                        # Add the answers if their type is CNAME or A
-                        for c_rr in c_response.rr:
-                            if c_rr.rtype == 5 or c_rr.rtype == 1: response.add_answer(c_rr)
+                        # Add the answers
+                        for c_rr in c_response.rr: response.add_answer(c_rr)
                         break
                     
                 self.cache_response(request, response, new_ip)
