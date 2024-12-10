@@ -29,25 +29,20 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
-        
-    def is_within_bailiwick(self, record_name, authoritative_domain):
-        """Check if the record's name is within the bailiwick of the authoritative domain."""
-        record_name_str = str(record_name).lower().rstrip('.')
-        authoritative_domain_str = str(authoritative_domain).lower().rstrip('.')
-        return record_name_str.endswith(f".{authoritative_domain_str}") or record_name_str == authoritative_domain_str
 
     # Gets a response from the local authoritative zone
     def get_local_res(self, response):
+        # Parses the authoritative zone file
         zoneStr = open('configs/example.com.zone', 'r').read()
         
         question = response.get_q()
         qname = question.qname
         qtype = question.qtype
 
-        # handles NS question type
+        # Handle NS question type
         if qtype == 2:
             for rr in RR.fromZone(zoneStr):
-                # adds matching answer if NS
+                # Add matching answer if NS
                 if (rr.rname == qname) & (rr.rtype == 2):
                     response.add_answer(rr)
                     qname2 = rr.rdata.toZone()
@@ -55,29 +50,29 @@ class Server:
                         if rr2.rname == qname2:
                             response.add_ar(rr2)
              
-            # sets status to NXDOMAIN if no auth
+            # Set status to NXDOMAIN if no auth
             if response.header.a == 0:
                 response.header.set_rcode(3)
 
             return response
         
-        # handles other question types
+        # Handle other question types
         for rr in RR.fromZone(zoneStr):
-            # adds matching answer if not SOA or NS
+            # Add matching answer if not SOA or NS
             if rr.rname == qname and rr.rtype != 6 and rr.rtype != 2:
                 response.add_answer(rr)
                     
-                # adds additional answers if rr is CNAME
+                # Add additional answers if rr is CNAME
                 if rr.rtype == 5:
                     qname2 = rr.rdata.toZone()
                     for rr2 in RR.fromZone(zoneStr):
                         if rr2.rname == qname2:
                             response.add_answer(rr2)
             
-            # adds authority section, should probably un-hard-code
+            # Add authority section
             if rr.rname == 'example.com' and rr.rtype == 2: response.add_auth(rr)
         
-        # sets status to NXDOMAIN if no answers
+        # Set status to NXDOMAIN if no answers
         if response.header.a == 0: response.header.set_rcode(3)
         return response
 
@@ -87,25 +82,28 @@ class Server:
         min_ttl = float('inf')
         for rr in response.rr + response.auth + response.ar:
             if rr.ttl == 0: return
-            if rr.ttl < min_ttl: min_ttl = rr.ttl 
-        expiration = time.time() + min_ttl
+            if rr.ttl < min_ttl: min_ttl = rr.ttl
         
-        self.cache[(request.get_q().qname, request.get_q().qtype, ip)] = (response, expiration)
+        # Cache the response and its expiration where the key is the request name, type, and IP address
+        self.cache[(request.get_q().qname, request.get_q().qtype, ip)] = (response, time.time() + min_ttl)
         
     # Gets a cached response if it exists
     def get_cached_response(self, request, ip):
         qname = request.get_q().qname
         qtype = request.get_q().qtype
+        
         if (qname, qtype, ip) in self.cache:
             response, expiration = self.cache[(qname, qtype, ip)]
             # Return if cache entry has not expired
             if time.time() < expiration: return response
             # Delete entry if it has expired
             else: del self.cache[(qname, qtype, ip)]
+            
+        # Return nothing if the entry is not present
         return None
     
     # Ensure nothing outside the server's bailiwick is included in a response
-    def bw_check(self, request, response):
+    def bailiwick_check(self, request, response):
         server = request.get_q().qname.idna().split(".")[-2] + "."
         a_removed = False
 
@@ -116,7 +114,7 @@ class Server:
         for rr in response.rr:
             if not rr.rname.matchSuffix(server):
                 response.rr.remove(rr)
-                a_removed= True
+                a_removed = True
         # Remove authority records outside of bailiwick
         for rr in response.auth:
             if not rr.rname.matchSuffix(server):
@@ -163,21 +161,22 @@ class Server:
             response = DNSRecord.parse(ext_data)
             
             # Remove anything outside of the server's bailiwck
-            response, a_removed = self.bw_check(request, response)
+            response, all_removed = self.bailiwick_check(request, response)
 
-            if response.header.a > 0 or a_removed:
+            # Evaluate and return the response if it contains or used to contain answers
+            # before the bailiwick checking
+            if response.header.a > 0 or all_removed:
                 for rr in response.rr:
-                    if rr.rtype == QTYPE.CNAME:
-                        # Resolve the CNAME record by recursively calling this function
-                        cname_request = DNSRecord()
-                        cname_request.add_question(DNSQuestion(str(rr.rdata.label), QTYPE.A))
-                        cname_response = self.get_ext_res(cname_request.pack(), cname_request.get_q().qtype)
+                    # Add the rest of the answers when there is a CNAME record
+                    if rr.rtype == 5:
+                        c_request = DNSRecord()
+                        c_request.add_question(DNSQuestion(str(rr.rdata.label), 1))
+                        # Recursively get the answers
+                        c_response = self.get_ext_res(c_request.pack(), c_request.get_q().qtype)
                         
-                    # Finally add the A record to the response
-                        for rr2 in cname_response.rr:
-                            # This duplicates records in the response but if it ain't broke...
-                            if rr2.rtype == QTYPE.A or rr2.rtype == QTYPE.CNAME:
-                                response.add_answer(rr2)
+                        # Add the answers if their type is CNAME or A
+                        for c_rr in c_response.rr:
+                            if c_rr.rtype == 5 or c_rr.rtype == 1: response.add_answer(c_rr)
                         break
                     
                 self.cache_response(request, response, new_ip)
@@ -196,22 +195,21 @@ class Server:
         local_res = self.get_local_res(response)
         # If answer found locally, send response
         if local_res.header.rcode != 3:
-            # set authoritative bit
+            # Set authoritative bit
             local_res.header.set_aa(1)
             self.send(addr, local_res)
         else:
             # If answer found externally, send response
             ext_res = self.get_ext_res(data, response.get_q().qtype)
             if ext_res.header.rcode != 3:
-                # unset authoritative bit
+                # Unset authoritative bit
                 ext_res.header.set_aa(0)
-                # set recursion available bit
+                # Set recursion available bit
                 ext_res.header.set_ra(1)
-                # unset truncation bit
+                # Unset truncation bit
                 ext_res.header.set_tc(0)
-                # Set ID to match the request
-                if request.header.id:
-                    ext_res.header.id = request.header.id
+                # Set ID to match the request in case of cached response
+                if request.header.id: ext_res.header.id = request.header.id
                 self.send(addr, ext_res)
             else:
                 # If no answer found, send NXDOMAIN response
@@ -220,10 +218,9 @@ class Server:
     def run(self):
         while True:
             socks = select.select([self.socket], [], [], 0.1)[0]
-            
-            #TODO: Figure out how to run in parallel from here?
-            
+
             for conn in socks:
+                # Run receive function asynchronously
                 self.executor.submit(self.recv, conn)
 
         return
