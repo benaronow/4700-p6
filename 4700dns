@@ -197,7 +197,7 @@ class Server:
             # Set authoritative bit
             local_res.header.set_aa(1)
             self.send(addr, local_res)
-        else:
+        elif response.header.rd:
             # If answer found externally, send response
             ext_res = self.get_ext_res(data, response.get_q().qtype)
             if ext_res.header.rcode != 3:
@@ -211,8 +211,9 @@ class Server:
                 if request.header.id: ext_res.header.id = request.header.id
                 self.send(addr, ext_res)
             else:
-                # If no answer found, send NXDOMAIN response
-                self.send(addr, local_res)
+                # If no answer found locally and rd unset, send SERVFAIL
+                response.header.rcode = 2
+                self.send(addr, response)
 
     def run(self):
         while True:
