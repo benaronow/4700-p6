@@ -22,7 +22,7 @@ once we learned why that was crucial, we were able to get it working.
 3. Good features/properties:
 We believe that we implemented the simulated DNS server in a relatively performant manner where there
 isn't much, if any, unnecessary behavior that would slow it down. The simplicity of our receive function
-(try local -> try external -> fail) is a positive feature and aided in our development of
+(try local -> try external -> send NXDOMAIN) is a positive feature and aided in our development of
 more complex features like caching. Our "recursive resolver" is also relatively minimalistic, simply
 updating the response by making new requests until it is valid, and made the integration of bailiwick
 checking and caching into our server very easy.
